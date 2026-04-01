@@ -39,3 +39,6 @@ ASR 阶段处理后，我们通过 G2P 过程将汉字全部转为拼音格式�
 1. Sentence Tier：展示完整 ASR 转写汉字，时间覆盖整个 Chunk。
 2. Word Tier：使用 jieba 对 ASR 文本分词，并根据音节数量按比例分配各词时间戳。
 3. Phoneme/Syllable Tier：展示对齐后的 IPA 符号（核心数据）。
+
+## 参考
+我们使用了[华东师范大学的儿化词表](https://yywz.ecnu.edu.cn/1f/58/c30556a335704/page.htm)

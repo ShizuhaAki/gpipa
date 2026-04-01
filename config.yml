@@ -19,7 +19,8 @@ hidden_dim: 256
 num_layers: 3
 dropout: 0.1
 
-output_dir: "output/checkpoints-merged"
+checkpoint_dir: "output/checkpoints-merged"
+output_dir: output/cli-test
 save_vocab: true
 
 vad:
@@ -27,7 +28,7 @@ vad:
   threshold: 0.5
   min_speech_ms: 250
   min_silence_ms: 200
-  speech_pad_ms: 100
+  speech_pad_ms: 400
   merge_gap_sec: 0.15
   max_chunk_sec: 12.0
   min_keep_sec: 0.2
