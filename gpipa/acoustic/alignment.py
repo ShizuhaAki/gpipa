@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 from pathlib import Path
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio
@@ -9,6 +10,11 @@ from rich.logging import RichHandler
 from gpipa.acoustic.dataloader import DataBakerDataset, FrameWiseDataCollator
 from gpipa.acoustic.model import FrameWiseBiLSTM
 from gpipa.acoustic.train import load_config
+
+try:
+    from numba import njit
+except ImportError:
+    njit = None
 
 logging.basicConfig(level="INFO", format="%(message)s", handlers=[RichHandler()])
 logger = logging.getLogger(__name__)
@@ -52,34 +58,6 @@ def _normalize_item(item: dict) -> dict:
     return new_item
 
 
-def _extract_non_blank_spans(
-    labels_1d: torch.Tensor,
-    blank_id: int,
-) -> list[tuple[int, int, int]]:
-    spans: list[tuple[int, int, int]] = []
-    start = None
-    prev = None
-    for i, v in enumerate(labels_1d.tolist()):
-        token = int(v)
-        if token == blank_id:
-            if prev is not None and start is not None:
-                spans.append((prev, start, i))
-                prev = None
-                start = None
-            continue
-        if prev is None:
-            prev = token
-            start = i
-            continue
-        if token != prev:
-            spans.append((prev, start, i))
-            prev = token
-            start = i
-    if prev is not None and start is not None:
-        spans.append((prev, start, len(labels_1d)))
-    return spans
-
-
 def _extract_spans_from_ids(labels_1d: torch.Tensor) -> list[tuple[int, int, int]]:
     spans: list[tuple[int, int, int]] = []
     if labels_1d.numel() == 0:
@@ -96,202 +74,176 @@ def _extract_spans_from_ids(labels_1d: torch.Tensor) -> list[tuple[int, int, int
     return spans
 
 
+def _viterbi_force_align_ctc_numpy_impl(
+    log_probs_tk: np.ndarray,
+    states: np.ndarray,
+    blank_id: int,
+) -> np.ndarray:
+    win_t = int(log_probs_tk.shape[0])
+    s_len = int(states.shape[0])
+    if win_t <= 0:
+        return np.empty((0,), dtype=np.int64)
+
+    neg_inf = np.float32(-1e30)
+    base_stay_penalty = np.float32(0.2)
+    base_stay_penalty_blank = np.float32(0.25)
+    soft_max_run = 8
+    soft_max_run_blank = 8
+    overtime_penalty = np.float32(0.8)
+    overtime_penalty_blank = np.float32(0.15)
+    max_run_bucket = 80
+
+    dp = np.full((win_t, s_len, max_run_bucket + 1), neg_inf, dtype=np.float32)
+    backptr_state = np.full((win_t, s_len, max_run_bucket + 1), -1, dtype=np.int32)
+    backptr_run = np.full((win_t, s_len, max_run_bucket + 1), -1, dtype=np.int32)
+
+    dp[0, 0, 1] = log_probs_tk[0, states[0]]
+    backptr_state[0, 0, 1] = 0
+    backptr_run[0, 0, 1] = 1
+    if s_len > 1:
+        dp[0, 1, 1] = log_probs_tk[0, states[1]]
+        backptr_state[0, 1, 1] = 1
+        backptr_run[0, 1, 1] = 1
+
+    for t in range(1, win_t):
+        for s in range(s_len):
+            token = states[s]
+            is_blank = token == blank_id
+            stay_pen = base_stay_penalty_blank if is_blank else base_stay_penalty
+            soft_limit = soft_max_run_blank if is_blank else soft_max_run
+            overtime_pen = overtime_penalty_blank if is_blank else overtime_penalty
+            emit_score = log_probs_tk[t, token]
+
+            for prev_r in range(1, max_run_bucket + 1):
+                prev_score = dp[t - 1, s, prev_r]
+                if prev_score <= neg_inf / 2.0:
+                    continue
+                new_r = prev_r + 1
+                if new_r > max_run_bucket:
+                    new_r = max_run_bucket
+                extra = prev_r - soft_limit + 1
+                if extra < 0:
+                    extra = 0
+                cand = prev_score - stay_pen - extra * overtime_pen + emit_score
+                if cand > dp[t, s, new_r]:
+                    dp[t, s, new_r] = cand
+                    backptr_state[t, s, new_r] = s
+                    backptr_run[t, s, new_r] = prev_r
+
+            if s - 1 >= 0:
+                for prev_r in range(1, max_run_bucket + 1):
+                    prev_score = dp[t - 1, s - 1, prev_r]
+                    if prev_score <= neg_inf / 2.0:
+                        continue
+                    cand = prev_score + emit_score
+                    if cand > dp[t, s, 1]:
+                        dp[t, s, 1] = cand
+                        backptr_state[t, s, 1] = s - 1
+                        backptr_run[t, s, 1] = prev_r
+
+            can_skip = s - 2 >= 0 and states[s] != blank_id and states[s] != states[s - 2]
+            if can_skip:
+                for prev_r in range(1, max_run_bucket + 1):
+                    prev_score = dp[t - 1, s - 2, prev_r]
+                    if prev_score <= neg_inf / 2.0:
+                        continue
+                    cand = prev_score + emit_score
+                    if cand > dp[t, s, 1]:
+                        dp[t, s, 1] = cand
+                        backptr_state[t, s, 1] = s - 2
+                        backptr_run[t, s, 1] = prev_r
+
+    if s_len == 1:
+        end_state = 0
+        end_run = 1
+        best_score = dp[win_t - 1, 0, 1]
+        for r in range(2, max_run_bucket + 1):
+            cand = dp[win_t - 1, 0, r]
+            if cand > best_score:
+                best_score = cand
+                end_run = r
+    else:
+        last_blank = s_len - 1
+        last_label = s_len - 2
+
+        best_blank_run = 1
+        best_blank_score = dp[win_t - 1, last_blank, 1]
+        for r in range(2, max_run_bucket + 1):
+            cand = dp[win_t - 1, last_blank, r]
+            if cand > best_blank_score:
+                best_blank_score = cand
+                best_blank_run = r
+
+        best_label_run = 1
+        best_label_score = dp[win_t - 1, last_label, 1]
+        for r in range(2, max_run_bucket + 1):
+            cand = dp[win_t - 1, last_label, r]
+            if cand > best_label_score:
+                best_label_score = cand
+                best_label_run = r
+
+        if best_blank_score >= best_label_score:
+            end_state = last_blank
+            end_run = best_blank_run
+        else:
+            end_state = last_label
+            end_run = best_label_run
+
+    state_path = np.empty((win_t,), dtype=np.int32)
+    cur_s = end_state
+    cur_r = end_run
+    for t in range(win_t - 1, -1, -1):
+        state_path[t] = cur_s
+        prev_s = backptr_state[t, cur_s, cur_r]
+        prev_r = backptr_run[t, cur_s, cur_r]
+        if prev_s < 0:
+            prev_s = 0
+        if prev_r < 1:
+            prev_r = 1
+        cur_s = prev_s
+        cur_r = prev_r
+
+    aligned_ids = np.empty((win_t,), dtype=np.int64)
+    for t in range(win_t):
+        aligned_ids[t] = states[state_path[t]]
+    return aligned_ids
+
+
+if njit is not None:
+    _viterbi_force_align_ctc_numpy_impl = njit(cache=False)(
+        _viterbi_force_align_ctc_numpy_impl
+    )
+
+
 def _viterbi_force_align_ctc(
-    log_probs_tk: torch.Tensor,
+    log_probs_tk: np.ndarray,
     target_ids: list[int],
     blank_id: int,
-    chunk_size: int = -1,
-    chunk_overlap: int = -1,
-    start_state_radius: int = -1,
-) -> torch.Tensor:
-    if log_probs_tk.dim() != 2:
+) -> np.ndarray:
+    log_probs_np = np.asarray(log_probs_tk, dtype=np.float32)
+    if log_probs_np.ndim != 2:
         raise ValueError(
-            f"Expected log_probs_tk to be [T, K], got shape={tuple(log_probs_tk.shape)}"
+            f"Expected log_probs_tk to be [T, K], got shape={tuple(log_probs_np.shape)}"
         )
-    t_len = int(log_probs_tk.size(0))
+    t_len = int(log_probs_np.shape[0])
     if t_len <= 0:
-        return torch.empty((0,), dtype=torch.long)
+        return np.empty((0,), dtype=np.int64)
     if not target_ids:
-        return torch.full((t_len,), fill_value=blank_id, dtype=torch.long)
-    # Expanded CTC state sequence: [blank, p1, blank, p2, ..., blank, pN, blank]
-    states: list[int] = [blank_id]
-    for token_id in target_ids:
-        states.append(int(token_id))
-        states.append(blank_id)
-    s_len = len(states)
+        return np.full((t_len,), fill_value=int(blank_id), dtype=np.int64)
 
-    def _decode_one_window(
-        log_probs_window_tk: torch.Tensor,
-        allowed_start_states: list[int] | None,
-    ) -> tuple[torch.Tensor, int]:
-        win_t = int(log_probs_window_tk.size(0))
-        if win_t <= 0:
-            return torch.empty((0,), dtype=torch.long), 0
-        neg_inf = float("-inf")
-        # Tunable duration-control hyperparameters.
-        base_stay_penalty = 0.15
-        base_stay_penalty_blank = 0.25
-        soft_max_run = 12
-        soft_max_run_blank = 8
-        overtime_penalty = 0.08
-        overtime_penalty_blank = 0.15
-        # dp[t, s, r] = best score at time t, state s, current run length bucket r
-        # r is clipped to max_run_bucket so state size stays bounded.
-        max_run_bucket = 40
-        dp = torch.full(
-            (win_t, s_len, max_run_bucket + 1),
-            fill_value=neg_inf,
-            dtype=log_probs_window_tk.dtype,
-        )
-        backptr_state = torch.full(
-            (win_t, s_len, max_run_bucket + 1), fill_value=-1, dtype=torch.long
-        )
-        backptr_run = torch.full(
-            (win_t, s_len, max_run_bucket + 1), fill_value=-1, dtype=torch.long
-        )
-        if allowed_start_states is None:
-            start_states = [0]
-            if s_len > 1:
-                start_states.append(1)
-        else:
-            start_states = [s for s in allowed_start_states if 0 <= s < s_len]
-            if not start_states:
-                start_states = [0]
-                if s_len > 1:
-                    start_states.append(1)
-        # Initialization: run length starts at 1 in any allowed state.
-        for s in start_states:
-            dp[0, s, 1] = log_probs_window_tk[0, states[s]]
-            backptr_state[0, s, 1] = s
-            backptr_run[0, s, 1] = 1
-        for t in range(1, win_t):
-            for s in range(s_len):
-                token = states[s]
-                is_blank = token == blank_id
-                stay_pen = base_stay_penalty_blank if is_blank else base_stay_penalty
-                soft_limit = soft_max_run_blank if is_blank else soft_max_run
-                overtime_pen = overtime_penalty_blank if is_blank else overtime_penalty
-                emit_score = log_probs_window_tk[t, token]
-                # 1) Stay in same state, increasing run length.
-                for prev_r in range(1, max_run_bucket + 1):
-                    prev_score = dp[t - 1, s, prev_r]
-                    if prev_score == neg_inf:
-                        continue
-                    new_r = min(prev_r + 1, max_run_bucket)
-                    extra = max(0, prev_r - soft_limit + 1) * overtime_pen
-                    cand = prev_score - stay_pen - extra + emit_score
-                    if cand > dp[t, s, new_r]:
-                        dp[t, s, new_r] = cand
-                        backptr_state[t, s, new_r] = s
-                        backptr_run[t, s, new_r] = prev_r
-                # 2) Advance from previous state, resetting run length to 1.
-                if s - 1 >= 0:
-                    for prev_r in range(1, max_run_bucket + 1):
-                        prev_score = dp[t - 1, s - 1, prev_r]
-                        if prev_score == neg_inf:
-                            continue
-                        cand = prev_score + emit_score
-                        if cand > dp[t, s, 1]:
-                            dp[t, s, 1] = cand
-                            backptr_state[t, s, 1] = s - 1
-                            backptr_run[t, s, 1] = prev_r
-                # 3) CTC skip from s-2, resetting run length to 1.
-                can_skip = (
-                    s - 2 >= 0 and states[s] != blank_id and states[s] != states[s - 2]
-                )
-                if can_skip:
-                    for prev_r in range(1, max_run_bucket + 1):
-                        prev_score = dp[t - 1, s - 2, prev_r]
-                        if prev_score == neg_inf:
-                            continue
-                        cand = prev_score + emit_score
-                        if cand > dp[t, s, 1]:
-                            dp[t, s, 1] = cand
-                            backptr_state[t, s, 1] = s - 2
-                            backptr_run[t, s, 1] = prev_r
-        # End in either the last blank or the last label, whichever is better.
-        if s_len == 1:
-            end_state = 0
-            end_run = int(torch.argmax(dp[win_t - 1, 0]).item())
-        else:
-            last_blank = s_len - 1
-            last_label = s_len - 2
-            best_blank_run = int(torch.argmax(dp[win_t - 1, last_blank]).item())
-            best_label_run = int(torch.argmax(dp[win_t - 1, last_label]).item())
-            best_blank_score = dp[win_t - 1, last_blank, best_blank_run]
-            best_label_score = dp[win_t - 1, last_label, best_label_run]
-            if best_blank_score >= best_label_score:
-                end_state = last_blank
-                end_run = best_blank_run
-            else:
-                end_state = last_label
-                end_run = best_label_run
-        # Backtrace state path.
-        state_path = torch.empty((win_t,), dtype=torch.long)
-        cur_s = int(end_state)
-        cur_r = int(end_run)
-        for t in range(win_t - 1, -1, -1):
-            state_path[t] = cur_s
-            prev_s = int(backptr_state[t, cur_s, cur_r].item())
-            prev_r = int(backptr_run[t, cur_s, cur_r].item())
-            if prev_s < 0:
-                prev_s = 0
-            if prev_r < 1:
-                prev_r = 1
-            cur_s, cur_r = prev_s, prev_r
-        aligned_ids_window = torch.tensor(
-            [states[int(s.item())] for s in state_path], dtype=torch.long
-        )
-        end_state_idx = int(state_path[-1].item()) if win_t > 0 else 0
-        return aligned_ids_window, end_state_idx
+    targets = np.asarray(target_ids, dtype=np.int64)
+    states = np.empty((targets.size * 2 + 1,), dtype=np.int64)
+    states[0] = int(blank_id)
+    states[1::2] = targets
+    states[2::2] = int(blank_id)
 
-    # Degenerate setup falls back to one-shot decoding.
-    if chunk_size <= 0 or chunk_size >= t_len:
-        aligned_full, _ = _decode_one_window(log_probs_tk, allowed_start_states=None)
-        return aligned_full
-    if chunk_overlap < 0:
-        chunk_overlap = 0
-    if chunk_overlap >= chunk_size:
-        chunk_overlap = max(0, chunk_size // 2)
-    stride = max(1, chunk_size - chunk_overlap)
-    left_keep = chunk_overlap // 2
-    right_keep = chunk_overlap - left_keep
-    stitched: list[torch.Tensor] = []
-    start = 0
-    anchor_state: int | None = None
-    while start < t_len:
-        end = min(start + chunk_size, t_len)
-        window = log_probs_tk[start:end]
-        allowed_states = None
-        if anchor_state is not None:
-            lo = max(0, anchor_state - max(0, start_state_radius))
-            hi = min(s_len - 1, anchor_state + max(0, start_state_radius))
-            allowed_states = list(range(lo, hi + 1))
-        aligned_window, end_state = _decode_one_window(
-            window, allowed_start_states=allowed_states
+    if int(states.min()) < 0 or int(states.max()) >= int(log_probs_np.shape[1]):
+        raise ValueError(
+            "CTC states contain token ids outside log-prob vocabulary range: "
+            f"min={int(states.min())}, max={int(states.max())}, K={int(log_probs_np.shape[1])}"
         )
-        anchor_state = end_state
-        keep_l = 0 if start == 0 else min(left_keep, int(aligned_window.numel()))
-        keep_r = (
-            0 if end == t_len else min(right_keep, int(aligned_window.numel()) - keep_l)
-        )
-        kept = aligned_window[keep_l : int(aligned_window.numel()) - keep_r]
-        if kept.numel() > 0:
-            stitched.append(kept)
-        start += stride
-    if not stitched:
-        return torch.full((t_len,), fill_value=blank_id, dtype=torch.long)
-    aligned_ids = torch.cat(stitched, dim=0)
-    if int(aligned_ids.numel()) < t_len:
-        pad = torch.full(
-            (t_len - int(aligned_ids.numel()),),
-            fill_value=int(aligned_ids[-1].item()),
-            dtype=torch.long,
-        )
-        aligned_ids = torch.cat([aligned_ids, pad], dim=0)
-    elif int(aligned_ids.numel()) > t_len:
-        aligned_ids = aligned_ids[:t_len]
-    return aligned_ids
+
+    return _viterbi_force_align_ctc_numpy_impl(log_probs_np, states, int(blank_id))
 
 
 def _escape_textgrid_text(s: str) -> str:
@@ -353,10 +305,89 @@ def _parse_uttids(uttids_raw: str | None, uttids_file: str | None) -> list[str]:
     return deduped
 
 
-def improved_decoding(logits, label2id, id2label):
+def _audio_array_to_mono_waveform(audio_array) -> torch.Tensor:
+    waveform = torch.as_tensor(audio_array, dtype=torch.float32)
+    if waveform.dim() == 1:
+        return waveform
+    if waveform.dim() == 2:
+        # Support both [C, T] and [T, C] layouts.
+        if int(waveform.size(0)) <= int(waveform.size(1)):
+            return waveform.mean(dim=0)
+        return waveform.mean(dim=1)
+    raise ValueError(f"Unsupported waveform shape: {tuple(waveform.shape)}")
+
+
+def _resample_1d_to_count(values: torch.Tensor, target_count: int) -> torch.Tensor:
+    if target_count <= 0:
+        return torch.empty((0,), dtype=torch.float32)
+    if values.numel() <= 0:
+        return torch.zeros((target_count,), dtype=torch.float32)
+    if int(values.numel()) == target_count:
+        return values.to(dtype=torch.float32)
+    if int(values.numel()) == 1:
+        return values.repeat(target_count).to(dtype=torch.float32)
+    x = values.view(1, 1, -1).to(dtype=torch.float32)
+    y = F.interpolate(x, size=target_count, mode="linear", align_corners=True)
+    return y.view(-1)
+
+
+def _compute_sil_high_energy_mask(
+    waveform_1d: torch.Tensor,
+    sampling_rate: int,
+    hop_length_ms: int,
+    target_num_frames: int,
+    noise_floor_quantile: float,
+    noise_threshold_db: float,
+) -> torch.Tensor:
+    if target_num_frames <= 0:
+        return torch.empty((0,), dtype=torch.bool)
+    if waveform_1d.numel() <= 0:
+        return torch.zeros((target_num_frames,), dtype=torch.bool)
+
+    sr = max(1, int(sampling_rate))
+    hop_samples = max(1, int(round(sr * (float(hop_length_ms) / 1000.0))))
+    frame_samples = max(1, int(round(sr * 0.025)))
+
+    wave = waveform_1d.to(dtype=torch.float32)
+    if int(wave.numel()) < frame_samples:
+        wave = F.pad(wave, (0, frame_samples - int(wave.numel())))
+
+    frame_chunks = wave.unfold(0, frame_samples, hop_samples)
+    frame_rms = torch.sqrt(torch.mean(frame_chunks * frame_chunks, dim=1) + 1e-12)
+    frame_rms = _resample_1d_to_count(frame_rms, target_num_frames)
+
+    q = min(1.0, max(0.0, float(noise_floor_quantile)))
+    noise_floor = float(torch.quantile(frame_rms, q).item())
+    noise_floor = max(noise_floor, 1e-8)
+    threshold = noise_floor * (10.0 ** (float(noise_threshold_db) / 20.0))
+    return frame_rms > threshold
+
+
+def improved_decoding(
+    logits,
+    label2id,
+    id2label,
+    sil_high_energy_mask: torch.Tensor | None = None,
+    sil_energy_penalty: float = 12.0,
+):
     logits = logits / 1
     sil_id = label2id["sil"]
     logits[:, :, sil_id] += 2.0
+    if sil_high_energy_mask is not None and sil_energy_penalty > 0:
+        if sil_high_energy_mask.dim() == 1:
+            sil_high_energy_mask = sil_high_energy_mask.unsqueeze(0)
+        sil_mask = sil_high_energy_mask.to(device=logits.device, dtype=logits.dtype)
+        if int(sil_mask.size(1)) != int(logits.size(1)):
+            sil_mask = F.interpolate(
+                sil_mask.unsqueeze(1),
+                size=int(logits.size(1)),
+                mode="nearest",
+            ).squeeze(1)
+        if int(sil_mask.size(0)) == 1 and int(logits.size(0)) > 1:
+            sil_mask = sil_mask.expand(int(logits.size(0)), -1)
+        logits[:, :, sil_id] = logits[:, :, sil_id] - sil_mask * float(
+            sil_energy_penalty
+        )
     log_probs = torch.log_softmax(logits, dim=-1)
     return log_probs
 
@@ -386,15 +417,13 @@ def _wav_to_fbank(
     expected_sampling_rate: int,
     hop_length_ms: int,
 ) -> torch.Tensor:
-    waveform, sr = torchaudio.load(str(wav_path))
-    if waveform.dim() != 2:
-        raise ValueError(
-            f"Invalid waveform shape from {wav_path}: {tuple(waveform.shape)}"
-        )
-    if waveform.size(0) > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    if sr != expected_sampling_rate:
-        waveform = torchaudio.functional.resample(waveform, sr, expected_sampling_rate)
+    waveform_loaded, loaded_sr = torchaudio.load(str(wav_path))
+    waveform_1d = _audio_array_to_mono_waveform(waveform_loaded)
+    if int(loaded_sr) != int(expected_sampling_rate):
+        waveform_1d = torchaudio.functional.resample(
+            waveform_1d.unsqueeze(0), int(loaded_sr), int(expected_sampling_rate)
+        ).squeeze(0)
+    waveform = waveform_1d.unsqueeze(0)
     waveform = waveform.float() * 32768.0
     fbank = torchaudio.compliance.kaldi.fbank(
         waveform,
@@ -464,7 +493,7 @@ def _boundary_time_mae_ms(
 
 def _redistribute_short_internal_sil(
     ids_1d: torch.Tensor,
-    sil_id: int=0
+    sil_id: int=0,
 ) -> torch.Tensor:
     """Split short internal sil spans equally to left/right neighbors."""
     out = ids_1d.clone()
@@ -503,6 +532,10 @@ def export_textgrids(
     mode: str,
     wavpath: str | None,
     transcript_path: str | None,
+    sil_energy_penalty: float = 12.0,
+    sil_noise_floor_quantile: float = 0.2,
+    sil_energy_threshold_db: float = 6.0,
+    should_compress_sil: bool = True,
 ) -> None:
     if mode not in {"test", "use"}:
         raise ValueError(f"Unsupported mode={mode}. Expected one of: test, use")
@@ -542,7 +575,28 @@ def export_textgrids(
             if decode_mode == "frame":
                 pred_ids = logits[0, :num_frames].argmax(dim=-1).to("cpu")
             else:
-                log_probs = improved_decoding(logits, label2id, id2label)
+                waveform_loaded, loaded_sr = torchaudio.load(str(wav_path_obj))
+                waveform_1d = _audio_array_to_mono_waveform(waveform_loaded)
+                expected_sr = int(config["sampling_rate"])
+                if int(loaded_sr) != expected_sr:
+                    waveform_1d = torchaudio.functional.resample(
+                        waveform_1d.unsqueeze(0), int(loaded_sr), expected_sr
+                    ).squeeze(0)
+                sil_mask = _compute_sil_high_energy_mask(
+                    waveform_1d=waveform_1d,
+                    sampling_rate=int(config["sampling_rate"]),
+                    hop_length_ms=int(config["hop_length_ms"]),
+                    target_num_frames=num_frames,
+                    noise_floor_quantile=sil_noise_floor_quantile,
+                    noise_threshold_db=sil_energy_threshold_db,
+                )
+                log_probs = improved_decoding(
+                    logits,
+                    label2id,
+                    id2label,
+                    sil_high_energy_mask=sil_mask,
+                    sil_energy_penalty=sil_energy_penalty,
+                )
                 truth_non_blank = [
                     p
                     for p in transcript_tokens
@@ -553,14 +607,16 @@ def export_textgrids(
                         "No valid non-blank phoneme tokens found in transcript."
                     )
                 pred_ids = _viterbi_force_align_ctc(
-                    log_probs_tk=log_probs[0, :num_frames],
+                    log_probs_tk=log_probs[0, :num_frames].detach().cpu().numpy(),
                     target_ids=[label2id[p] for p in truth_non_blank],
                     blank_id=blank_id,
                 )
-            pred_ids = _redistribute_short_internal_sil(
-                pred_ids,
-                sil_id=0,
-            )
+                pred_ids = torch.from_numpy(pred_ids)
+            if should_compress_sil:
+                pred_ids = _redistribute_short_internal_sil(
+                    pred_ids,
+                    sil_id=0,
+                )
             intervals, xmax = _ids_to_intervals(
                 pred_ids, id2label=id2label, hop_s=hop_s
             )
@@ -593,21 +649,38 @@ def export_textgrids(
             if decode_mode == "frame":
                 pred_ids = logits[0, :num_frames].argmax(dim=-1).to("cpu")
             else:
-                log_probs = improved_decoding(logits, label2id, id2label)
+                waveform_1d = _audio_array_to_mono_waveform(item["audio"]["array"])
+                sil_mask = _compute_sil_high_energy_mask(
+                    waveform_1d=waveform_1d,
+                    sampling_rate=int(config["sampling_rate"]),
+                    hop_length_ms=int(config["hop_length_ms"]),
+                    target_num_frames=num_frames,
+                    noise_floor_quantile=sil_noise_floor_quantile,
+                    noise_threshold_db=sil_energy_threshold_db,
+                )
+                log_probs = improved_decoding(
+                    logits,
+                    label2id,
+                    id2label,
+                    sil_high_energy_mask=sil_mask,
+                    sil_energy_penalty=sil_energy_penalty,
+                )
                 truth_phonemes = [p for p in batch.target_phonemes[0] if p in label2id]
                 truth_non_blank = [p for p in truth_phonemes if label2id[p] != blank_id]
                 if not truth_non_blank:
                     logger.warning("Skip %s: no non-blank targets", utt_id)
                     continue
                 pred_ids = _viterbi_force_align_ctc(
-                    log_probs_tk=log_probs[0, :num_frames],
+                    log_probs_tk=log_probs[0, :num_frames].detach().cpu().numpy(),
                     target_ids=[label2id[p] for p in truth_non_blank],
                     blank_id=blank_id
                 )
-            pred_ids = _redistribute_short_internal_sil(
-                pred_ids,
-                sil_id=0,
-            )
+                pred_ids = torch.from_numpy(pred_ids)
+            if should_compress_sil:
+                pred_ids = _redistribute_short_internal_sil(
+                    pred_ids,
+                    sil_id=0,
+                )
             intervals, xmax = _ids_to_intervals(
                 pred_ids, id2label=id2label, hop_s=hop_s
             )
@@ -682,28 +755,28 @@ def parse_args():
         help="Decoding mode. 'forced' uses CTC-style Viterbi with dataloader phoneme targets.",
     )
     parser.add_argument(
+        "--sil-energy-penalty",
+        type=float,
+        default=2.0,
+        help="Penalty subtracted from sil logits on frames above the energy threshold.",
+    )
+    parser.add_argument(
+        "--sil-noise-floor-quantile",
+        type=float,
+        default=0.2,
+        help="Quantile used to estimate background noise floor from frame RMS energy.",
+    )
+    parser.add_argument(
+        "--sil-energy-threshold-db",
+        type=float,
+        default=3.0,
+        help="Frame is treated as non-noise when RMS exceeds noise floor by this many dB.",
+    )
+    parser.add_argument(
         "--smooth-window",
         type=int,
         default=-1,
         help="Mode-smoothing window (frames) for frame decode. <=1 disables smoothing.",
-    )
-    parser.add_argument(
-        "--viterbi-chunk-size",
-        type=int,
-        default=-1,
-        help="Sliding-window size (frames) for forced Viterbi decode. <=0 disables chunking.",
-    )
-    parser.add_argument(
-        "--viterbi-chunk-overlap",
-        type=int,
-        default=60,
-        help="Overlap size (frames) between neighboring Viterbi chunks.",
-    )
-    parser.add_argument(
-        "--viterbi-start-state-radius",
-        type=int,
-        default=6,
-        help="Allowed state radius around previous chunk end-state when initializing next chunk.",
     )
     return parser.parse_args()
 
@@ -718,11 +791,11 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         uttids=uttids,
         decode_mode=args.decode_mode,
-        smooth_window=args.smooth_window,
-        viterbi_chunk_size=args.viterbi_chunk_size,
-        viterbi_chunk_overlap=args.viterbi_chunk_overlap,
-        viterbi_start_state_radius=args.viterbi_start_state_radius,
         mode=args.mode,
         wavpath=args.wavpath,
         transcript_path=args.transcript_path,
+        sil_energy_penalty=args.sil_energy_penalty,
+        sil_noise_floor_quantile=args.sil_noise_floor_quantile,
+        sil_energy_threshold_db=args.sil_energy_threshold_db,
+        should_compress_sil=True
     )
