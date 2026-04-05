@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Mapping, Optional, Set
 
 from pinyin_to_ipa import pinyin_to_ipa as _pinyin_to_ipa
 from pypinyin import Style, lazy_pinyin, load_phrases_dict
@@ -13,38 +13,154 @@ except Exception:
     textgrid = None
 
 
-CUSTOM_PHRASES: Dict[str, List[str]] = {
-    "你好": ["ni2", "hao3"],
-    "老虎": ["lao3", "hu3"],
-    "了解": ["liao3", "jie3"],
-    "妈妈": ["ma1", "ma5"],
-    "爸爸": ["ba4", "ba5"],
-    "我们": ["wo3", "men5"],
-    "什么": ["shen2", "me5"],
-    "东西": ["dong1", "xi5"],
-    "知道": ["zhi1", "dao5"],
-    "一定": ["yi2", "ding4"],
-    "不要": ["bu2", "yao4"],
-}
+DEFAULT_CUSTOM_PHRASES: Dict[str, List[str]] = {}
 
-_CUSTOM_PHRASES_LOADED = False
+_LOADED_CUSTOM_PHRASES_SIGNATURES: set[tuple[tuple[str, tuple[str, ...]], ...]] = set()
 _ERHUA_WORDS: Optional[Set[str]] = None
+_PINYIN_TONE_RE = re.compile(r"^([a-z]+r?)([1-5]?)$")
 
 
-def _load_custom_phrases_once() -> None:
-    global _CUSTOM_PHRASES_LOADED
-    if _CUSTOM_PHRASES_LOADED:
+def _normalize_custom_phrases(
+    custom_phrases: Optional[Mapping[str, Iterable[str]]],
+) -> Dict[str, List[str]]:
+    merged: Dict[str, List[str]] = {
+        phrase: [str(syllable).strip().lower() for syllable in syllables if str(syllable).strip()]
+        for phrase, syllables in DEFAULT_CUSTOM_PHRASES.items()
+    }
+
+    if not custom_phrases:
+        return merged
+
+    for phrase, syllables in custom_phrases.items():
+        key = str(phrase).strip()
+        if not key:
+            continue
+        values = [
+            str(syllable).strip().lower()
+            for syllable in syllables
+            if str(syllable).strip()
+        ]
+        if values:
+            merged[key] = values
+
+    return merged
+
+
+def _custom_phrase_signature(phrases: Dict[str, List[str]]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    normalized_items = [
+        (str(key), tuple(str(syllable) for syllable in value))
+        for key, value in phrases.items()
+        if str(key).strip() and value
+    ]
+    normalized_items.sort(key=lambda item: item[0])
+    return tuple(normalized_items)
+
+
+def _load_custom_phrases_once(
+    custom_phrases: Optional[Mapping[str, Iterable[str]]] = None,
+) -> None:
+    phrases = _normalize_custom_phrases(custom_phrases)
+    signature = _custom_phrase_signature(phrases)
+    if not signature or signature in _LOADED_CUSTOM_PHRASES_SIGNATURES:
         return
 
     load_phrases_dict(
-        {phrase: [[syllable] for syllable in syllables] for phrase, syllables in CUSTOM_PHRASES.items()},
+        {phrase: [[syllable] for syllable in syllables] for phrase, syllables in phrases.items()},
         style="tone3",
     )
-    _CUSTOM_PHRASES_LOADED = True
+    _LOADED_CUSTOM_PHRASES_SIGNATURES.add(signature)
 
 
 def _normalize_phone(phone: str) -> str:
     return str(phone).strip().lower()
+
+
+def _split_pinyin_tone(token: str) -> tuple[str, str]:
+    m = _PINYIN_TONE_RE.match(_normalize_phone(token))
+    if not m:
+        return "", ""
+    return m.group(1), m.group(2)
+
+
+def _set_pinyin_tone(token: str, tone: str) -> str:
+    body, current_tone = _split_pinyin_tone(token)
+    if not body:
+        return _normalize_phone(token)
+
+    target_tone = str(tone).strip() or current_tone
+    if target_tone not in {"1", "2", "3", "4", "5"}:
+        target_tone = current_tone
+    return f"{body}{target_tone}"
+
+
+def _apply_explicit_tone_sandhi(text: str, tokens: List[str]) -> List[str]:
+    if not text or len(tokens) != len(text):
+        return tokens
+
+    out = [_normalize_phone(token) for token in tokens]
+
+    # Normalize tone-less pinyin to neutral tone 5.
+    for idx, token in enumerate(out):
+        body, tone = _split_pinyin_tone(token)
+        if body and not tone:
+            out[idx] = f"{body}5"
+
+    def _next_tone(idx: int) -> str:
+        for j in range(idx + 1, len(out)):
+            _, tone = _split_pinyin_tone(out[j])
+            if tone:
+                return tone
+        return ""
+
+    # 一: yi1 -> yi2 before tone4, yi4 before tone1/2/3.
+    for idx, char in enumerate(text):
+        if char != "一":
+            continue
+        body, tone = _split_pinyin_tone(out[idx])
+        if not body.startswith("yi"):
+            continue
+        next_tone = _next_tone(idx)
+        if next_tone == "4":
+            out[idx] = _set_pinyin_tone(out[idx], "2")
+        elif next_tone in {"1", "2", "3"}:
+            out[idx] = _set_pinyin_tone(out[idx], "4")
+        elif not tone:
+            out[idx] = _set_pinyin_tone(out[idx], "1")
+
+    # 不: bu4 -> bu2 before tone4.
+    for idx, char in enumerate(text):
+        if char != "不":
+            continue
+        body, _ = _split_pinyin_tone(out[idx])
+        if body != "bu":
+            continue
+        next_tone = _next_tone(idx)
+        if next_tone == "4":
+            out[idx] = _set_pinyin_tone(out[idx], "2")
+        else:
+            out[idx] = _set_pinyin_tone(out[idx], "4")
+
+    # Third-tone sandhi: in a 3-3 chain, all but the last become tone2.
+    run_start = 0
+    while run_start < len(out):
+        _, tone = _split_pinyin_tone(out[run_start])
+        if tone != "3":
+            run_start += 1
+            continue
+
+        run_end = run_start
+        while run_end + 1 < len(out):
+            _, next_tone = _split_pinyin_tone(out[run_end + 1])
+            if next_tone != "3":
+                break
+            run_end += 1
+
+        if run_end > run_start:
+            for idx in range(run_start, run_end):
+                out[idx] = _set_pinyin_tone(out[idx], "2")
+        run_start = run_end + 1
+
+    return out
 
 
 def _load_erhua_words_once() -> Set[str]:
@@ -128,12 +244,13 @@ def _hanzi2pinyin_tokens(
     *,
     tone_sandhi: bool = True,
     neutral_tone_with_five: bool = True,
+    custom_phrases: Optional[Mapping[str, Iterable[str]]] = None,
 ) -> List[str]:
     text = str(text)
     if not text:
         return []
 
-    _load_custom_phrases_once()
+    _load_custom_phrases_once(custom_phrases=custom_phrases)
     phones = lazy_pinyin(
         text,
         style=Style.TONE3,
@@ -144,7 +261,10 @@ def _hanzi2pinyin_tokens(
     )
 
     if len(phones) == len(text):
-        return _apply_vocab_normalization(text, [_normalize_phone(phone) for phone in phones])
+        tokens = [_normalize_phone(phone) for phone in phones]
+        if tone_sandhi:
+            tokens = _apply_explicit_tone_sandhi(text, tokens)
+        return _apply_vocab_normalization(text, tokens)
 
     fallback: List[str] = []
     for char in text:
@@ -157,7 +277,25 @@ def _hanzi2pinyin_tokens(
             errors="default",
         )
         fallback.append(_normalize_phone(current[0]) if current else _normalize_phone(char))
+    if tone_sandhi:
+        fallback = _apply_explicit_tone_sandhi(text, fallback)
     return _apply_vocab_normalization(text, fallback)
+
+
+def _restore_vocab_phone_for_ipa(token: str) -> str:
+    token = _normalize_phone(token)
+    if not token:
+        return token
+
+    m = re.match(r"^(zh|ch|sh)iii([1-5]?)$", token)
+    if m:
+        return f"{m.group(1)}i{m.group(2)}"
+
+    m = re.match(r"^(z|c|s)ii([1-5]?)$", token)
+    if m:
+        return f"{m.group(1)}i{m.group(2)}"
+
+    return token
 
 
 def hanzi2pinyin_tokens(
@@ -165,27 +303,40 @@ def hanzi2pinyin_tokens(
     *,
     tone_sandhi: bool = True,
     neutral_tone_with_five: bool = True,
+    custom_phrases: Optional[Mapping[str, Iterable[str]]] = None,
 ) -> List[str]:
     """Convert hanzi text to tone3 pinyin tokens."""
     return _hanzi2pinyin_tokens(
         text,
         tone_sandhi=tone_sandhi,
         neutral_tone_with_five=neutral_tone_with_five,
+        custom_phrases=custom_phrases,
     )
 
 
 def _pinyin2ipa(phone: str) -> str:
-    phone = _normalize_phone(phone)
-    if not phone:
+    raw_phone = _normalize_phone(phone)
+    if not raw_phone:
         return ""
 
+    phone_for_ipa = _restore_vocab_phone_for_ipa(raw_phone)
+
     try:
-        variants = _pinyin_to_ipa(phone)
-        if not variants:
-            return phone
-        return "".join(next(iter(variants)))
+        variants = _pinyin_to_ipa(phone_for_ipa)
     except Exception:
-        return phone
+        return raw_phone
+
+    if not variants:
+        return raw_phone
+
+    serialized = sorted({"".join(item) for item in variants})
+    if not serialized:
+        return raw_phone
+    return serialized[0]
+
+
+def pinyin_tokens_to_ipa_tokens(tokens: Iterable[str]) -> List[str]:
+    return [_pinyin2ipa(token) for token in tokens if str(token).strip()]
 
 
 def _require_praatio() -> None:
@@ -283,6 +434,7 @@ def hanzi_textgrid_to_pinyin_textgrid(
     output_tier_name: str = "pinyin",
     tone_sandhi: bool = True,
     include_empty: bool = True,
+    custom_phrases: Optional[Mapping[str, Iterable[str]]] = None,
 ) -> None:
     """Convert hanzi labels in TextGrid intervals to tone3 pinyin labels."""
     source_intervals = read_textgrid_intervals(
@@ -297,7 +449,13 @@ def hanzi_textgrid_to_pinyin_textgrid(
         if not raw_text:
             output_label = ""
         else:
-            output_label = " ".join(_hanzi2pinyin_tokens(raw_text, tone_sandhi=tone_sandhi))
+            output_label = " ".join(
+                _hanzi2pinyin_tokens(
+                    raw_text,
+                    tone_sandhi=tone_sandhi,
+                    custom_phrases=custom_phrases,
+                )
+            )
         output_intervals.append((float(item["start"]), float(item["end"]), output_label))
 
     write_textgrid_single_tier(
@@ -347,6 +505,7 @@ def hanzi_textgrid_to_ipa_textgrid(
     output_tier_name: str = "ipa",
     tone_sandhi: bool = True,
     include_empty: bool = True,
+    custom_phrases: Optional[Mapping[str, Iterable[str]]] = None,
 ) -> None:
     """Convert hanzi labels in TextGrid intervals directly to IPA labels."""
     source_intervals = read_textgrid_intervals(
@@ -361,7 +520,11 @@ def hanzi_textgrid_to_ipa_textgrid(
         if not raw_text:
             output_label = ""
         else:
-            pinyin_tokens = _hanzi2pinyin_tokens(raw_text, tone_sandhi=tone_sandhi)
+            pinyin_tokens = _hanzi2pinyin_tokens(
+                raw_text,
+                tone_sandhi=tone_sandhi,
+                custom_phrases=custom_phrases,
+            )
             output_label = " ".join(_pinyin2ipa(token) for token in pinyin_tokens)
         output_intervals.append((float(item["start"]), float(item["end"]), output_label))
 
@@ -382,6 +545,7 @@ def convert_textgrid(
     output_tier_name: Optional[str] = None,
     tone_sandhi: bool = True,
     include_empty: bool = True,
+    custom_phrases: Optional[Mapping[str, Iterable[str]]] = None,
 ) -> None:
     """Unified TextGrid conversion entrypoint for hanzi/pinyin/ipa labels."""
     route = (str(source).strip().lower(), str(target).strip().lower())
@@ -394,6 +558,7 @@ def convert_textgrid(
             output_tier_name=output_tier_name or "pinyin",
             tone_sandhi=tone_sandhi,
             include_empty=include_empty,
+            custom_phrases=custom_phrases,
         )
         return
 
@@ -415,6 +580,7 @@ def convert_textgrid(
             output_tier_name=output_tier_name or "ipa",
             tone_sandhi=tone_sandhi,
             include_empty=include_empty,
+            custom_phrases=custom_phrases,
         )
         return
 
@@ -429,6 +595,7 @@ __all__ = [
     "hanzi2pinyin_tokens",
     "hanzi_textgrid_to_ipa_textgrid",
     "hanzi_textgrid_to_pinyin_textgrid",
+    "pinyin_tokens_to_ipa_tokens",
     "pinyin_textgrid_to_ipa_textgrid",
     "read_textgrid_intervals",
     "write_textgrid_single_tier",

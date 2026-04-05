@@ -19,6 +19,32 @@ except ImportError:
 logging.basicConfig(level="INFO", format="%(message)s", handlers=[RichHandler()])
 logger = logging.getLogger(__name__)
 
+DEFAULT_VITERBI_CONFIG = {
+    "base_stay_penalty": 0.2,
+    "base_stay_penalty_blank": 0.25,
+    "soft_max_run": 8,
+    "soft_max_run_blank": 8,
+    "overtime_penalty": 0.8,
+    "overtime_penalty_blank": 0.15,
+    "max_run_bucket": 80,
+}
+
+
+def _resolve_viterbi_config(raw_cfg: dict | None) -> dict:
+    cfg = dict(DEFAULT_VITERBI_CONFIG)
+    if isinstance(raw_cfg, dict):
+        cfg.update(raw_cfg)
+
+    return {
+        "base_stay_penalty": max(0.0, float(cfg["base_stay_penalty"])),
+        "base_stay_penalty_blank": max(0.0, float(cfg["base_stay_penalty_blank"])),
+        "soft_max_run": max(1, int(cfg["soft_max_run"])),
+        "soft_max_run_blank": max(1, int(cfg["soft_max_run_blank"])),
+        "overtime_penalty": max(0.0, float(cfg["overtime_penalty"])),
+        "overtime_penalty_blank": max(0.0, float(cfg["overtime_penalty_blank"])),
+        "max_run_bucket": max(2, int(cfg["max_run_bucket"])),
+    }
+
 
 def _sanitize_omp_num_threads() -> None:
     raw = os.environ.get("OMP_NUM_THREADS")
@@ -78,6 +104,13 @@ def _viterbi_force_align_ctc_numpy_impl(
     log_probs_tk: np.ndarray,
     states: np.ndarray,
     blank_id: int,
+    base_stay_penalty: float,
+    base_stay_penalty_blank: float,
+    soft_max_run: int,
+    soft_max_run_blank: int,
+    overtime_penalty: float,
+    overtime_penalty_blank: float,
+    max_run_bucket: int,
 ) -> np.ndarray:
     win_t = int(log_probs_tk.shape[0])
     s_len = int(states.shape[0])
@@ -85,13 +118,13 @@ def _viterbi_force_align_ctc_numpy_impl(
         return np.empty((0,), dtype=np.int64)
 
     neg_inf = np.float32(-1e30)
-    base_stay_penalty = np.float32(0.2)
-    base_stay_penalty_blank = np.float32(0.25)
-    soft_max_run = 8
-    soft_max_run_blank = 8
-    overtime_penalty = np.float32(0.8)
-    overtime_penalty_blank = np.float32(0.15)
-    max_run_bucket = 80
+    base_stay_penalty = np.float32(base_stay_penalty)
+    base_stay_penalty_blank = np.float32(base_stay_penalty_blank)
+    soft_max_run = int(soft_max_run)
+    soft_max_run_blank = int(soft_max_run_blank)
+    overtime_penalty = np.float32(overtime_penalty)
+    overtime_penalty_blank = np.float32(overtime_penalty_blank)
+    max_run_bucket = int(max_run_bucket)
 
     dp = np.full((win_t, s_len, max_run_bucket + 1), neg_inf, dtype=np.float32)
     backptr_state = np.full((win_t, s_len, max_run_bucket + 1), -1, dtype=np.int32)
@@ -219,6 +252,7 @@ def _viterbi_force_align_ctc(
     log_probs_tk: np.ndarray,
     target_ids: list[int],
     blank_id: int,
+    viterbi_cfg: dict | None = None,
 ) -> np.ndarray:
     log_probs_np = np.asarray(log_probs_tk, dtype=np.float32)
     if log_probs_np.ndim != 2:
@@ -243,7 +277,19 @@ def _viterbi_force_align_ctc(
             f"min={int(states.min())}, max={int(states.max())}, K={int(log_probs_np.shape[1])}"
         )
 
-    return _viterbi_force_align_ctc_numpy_impl(log_probs_np, states, int(blank_id))
+    cfg = _resolve_viterbi_config(viterbi_cfg)
+    return _viterbi_force_align_ctc_numpy_impl(
+        log_probs_np,
+        states,
+        int(blank_id),
+        float(cfg["base_stay_penalty"]),
+        float(cfg["base_stay_penalty_blank"]),
+        int(cfg["soft_max_run"]),
+        int(cfg["soft_max_run_blank"]),
+        float(cfg["overtime_penalty"]),
+        float(cfg["overtime_penalty_blank"]),
+        int(cfg["max_run_bucket"]),
+    )
 
 
 def _escape_textgrid_text(s: str) -> str:
@@ -540,6 +586,8 @@ def export_textgrids(
     if mode not in {"test", "use"}:
         raise ValueError(f"Unsupported mode={mode}. Expected one of: test, use")
     config = load_config(config_path)
+    alignment_cfg = config.get("alignment") or {}
+    viterbi_cfg = _resolve_viterbi_config(alignment_cfg.get("viterbi"))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, label2id = _load_model(Path(checkpoint_path), device)
     id2label = {idx: label for label, idx in label2id.items()}
@@ -610,6 +658,7 @@ def export_textgrids(
                     log_probs_tk=log_probs[0, :num_frames].detach().cpu().numpy(),
                     target_ids=[label2id[p] for p in truth_non_blank],
                     blank_id=blank_id,
+                    viterbi_cfg=viterbi_cfg,
                 )
                 pred_ids = torch.from_numpy(pred_ids)
             if should_compress_sil:
@@ -673,7 +722,8 @@ def export_textgrids(
                 pred_ids = _viterbi_force_align_ctc(
                     log_probs_tk=log_probs[0, :num_frames].detach().cpu().numpy(),
                     target_ids=[label2id[p] for p in truth_non_blank],
-                    blank_id=blank_id
+                    blank_id=blank_id,
+                    viterbi_cfg=viterbi_cfg,
                 )
                 pred_ids = torch.from_numpy(pred_ids)
             if should_compress_sil:

@@ -32,3 +32,27 @@ vad:
   merge_gap_sec: 0.15
   max_chunk_sec: 12.0
   min_keep_sec: 0.2
+
+g2p:
+  custom_phrases:
+    你好: [ni2, hao3]
+    老虎: [lao3, hu3]
+    了解: [liao3, jie3]
+    妈妈: [ma1, ma5]
+    爸爸: [ba4, ba5]
+    我们: [wo3, men5]
+    什么: [shen2, me5]
+    东西: [dong1, xi5]
+    知道: [zhi1, dao5]
+    一定: [yi2, ding4]
+    不要: [bu2, yao4]
+
+alignment:
+  viterbi:
+    base_stay_penalty: 0.2
+    base_stay_penalty_blank: 0.25
+    soft_max_run: 8
+    soft_max_run_blank: 8
+    overtime_penalty: 0.8
+    overtime_penalty_blank: 0.15
+    max_run_bucket: 80

@@ -1,11 +1,12 @@
 from gpipa.asr.qwen_asr import recognize
 from gpipa.acoustic.alignment import export_textgrids
-from gpipa.g2p.hanzi2pinyin import hanzi2pinyin
+from gpipa.g2p.g2p_utils import hanzi2pinyin_tokens, pinyin_tokens_to_ipa_tokens
 import logging
 from pathlib import Path
 import yaml
 import json
 import re
+from typing import Iterable, List, Sequence, Tuple
 
 import torch
 import torchaudio
@@ -148,13 +149,24 @@ def _load_vocab_set(config):
     return set(vocab.keys())
 
 
-def _normalize_tokens_for_alignment(pinyin_text, vocab_set):
+def _normalize_tokens_for_alignment(pinyin_tokens: str | Iterable[str], vocab_set):
     normalized = []
-    for token in pinyin_text.split():
-        base = re.sub(r"[1-5]$", "", token.strip().lower())
+    kept_tone_tokens = []
+
+    if isinstance(pinyin_tokens, str):
+        token_stream = pinyin_tokens.split()
+    else:
+        token_stream = [str(token) for token in pinyin_tokens]
+
+    for token in token_stream:
+        raw = token.strip().lower()
+        if not raw:
+            continue
+        base = re.sub(r"[1-5]$", "", raw)
         if base in vocab_set:
             normalized.append(base)
-    return normalized
+            kept_tone_tokens.append(raw)
+    return normalized, kept_tone_tokens
 
 
 def _build_interval_tier(tier_name, intervals, max_t):
@@ -171,9 +183,124 @@ def _save_textgrid(tg, output_path):
         tg.save(str(output_path))
 
 
+def _ensure_nonempty_intervals(intervals: Sequence[Tuple[float, float, str]], xmax: float):
+    if intervals:
+        return list(intervals)
+    return [(0.0, float(xmax), "")]
+
+
+def _read_single_tier_intervals(tg_path: str) -> Tuple[List[Tuple[float, float, str]], float]:
+    tg = textgrid.openTextgrid(str(tg_path), includeEmptyIntervals=False)
+    if not tg.tierNames:
+        return [], 0.0
+
+    tier = tg.getTier(tg.tierNames[0])
+    intervals: List[Tuple[float, float, str]] = []
+    xmax = 0.0
+    for entry in tier.entries:
+        start = float(entry.start)
+        end = float(entry.end)
+        label = "" if entry.label is None else str(entry.label)
+        intervals.append((start, end, label))
+        if end > xmax:
+            xmax = end
+
+    return intervals, xmax
+
+
+def _segment_words(text: str) -> List[str]:
+    try:
+        import jieba
+    except ImportError as exc:
+        raise ImportError(
+            "jieba is required for Word tier construction. Install it with: pip install jieba"
+        ) from exc
+
+    return [word for word in jieba.lcut(text) if str(word).strip()]
+
+
+def _build_word_intervals(
+    words: Sequence[str],
+    word_token_counts: Sequence[int],
+    phoneme_non_sil_intervals: Sequence[Tuple[float, float, str]],
+    asr_text: str,
+    xmax: float,
+) -> List[Tuple[float, float, str]]:
+    if not words or not phoneme_non_sil_intervals:
+        label = asr_text.strip()
+        return [(0.0, float(xmax), label)] if label else [(0.0, float(xmax), "")]
+
+    intervals: List[Tuple[float, float, str]] = []
+    cursor = 0
+    total = len(phoneme_non_sil_intervals)
+
+    for idx, word in enumerate(words):
+        token_count = int(word_token_counts[idx]) if idx < len(word_token_counts) else 0
+        if token_count <= 0:
+            continue
+        if cursor >= total:
+            break
+
+        end_idx = min(cursor + token_count - 1, total - 1)
+        start = float(phoneme_non_sil_intervals[cursor][0])
+        end = float(phoneme_non_sil_intervals[end_idx][1])
+        label = str(word).strip()
+        if label and end > start:
+            intervals.append((start, end, label))
+        cursor = end_idx + 1
+
+    if intervals:
+        return intervals
+
+    label = asr_text.strip()
+    return [(0.0, float(xmax), label)] if label else [(0.0, float(xmax), "")]
+
+
+def _rewrite_three_tier_textgrid(
+    alignment_textgrid_path: str,
+    asr_text: str,
+    ipa_tokens: Sequence[str],
+    words: Sequence[str],
+    word_token_counts: Sequence[int],
+) -> None:
+    base_intervals, xmax = _read_single_tier_intervals(alignment_textgrid_path)
+
+    phoneme_intervals: List[Tuple[float, float, str]] = []
+    non_sil_intervals: List[Tuple[float, float, str]] = []
+    ipa_cursor = 0
+    for start, end, label in base_intervals:
+        raw_label = str(label).strip()
+        if raw_label and raw_label.lower() != "sil":
+            mapped_label = (
+                str(ipa_tokens[ipa_cursor])
+                if ipa_cursor < len(ipa_tokens)
+                else raw_label
+            )
+            ipa_cursor += 1
+            phoneme_intervals.append((start, end, mapped_label))
+            non_sil_intervals.append((start, end, mapped_label))
+        else:
+            phoneme_intervals.append((start, end, raw_label or "sil"))
+
+    sentence_label = asr_text.strip()
+    sentence_intervals = [(0.0, float(xmax), sentence_label)] if sentence_label else [(0.0, float(xmax), "")]
+    word_intervals = _build_word_intervals(
+        words=words,
+        word_token_counts=word_token_counts,
+        phoneme_non_sil_intervals=non_sil_intervals,
+        asr_text=asr_text,
+        xmax=xmax,
+    )
+
+    tg = textgrid.Textgrid()
+    tg.addTier(_build_interval_tier("Sentence", _ensure_nonempty_intervals(sentence_intervals, xmax), float(xmax)))
+    tg.addTier(_build_interval_tier("Word", _ensure_nonempty_intervals(word_intervals, xmax), float(xmax)))
+    tg.addTier(_build_interval_tier("Phoneme", _ensure_nonempty_intervals(phoneme_intervals, xmax), float(xmax)))
+    _save_textgrid(tg, Path(alignment_textgrid_path))
+
+
 def _merge_segment_textgrids(segment_results, merged_textgrid_path, total_duration_sec):
-    shifted_intervals = []
-    tier_name = "phones"
+    tier_to_intervals = {}
 
     for seg in segment_results:
         tg_path = seg.get("textgrid_path")
@@ -185,24 +312,46 @@ def _merge_segment_textgrids(segment_results, merged_textgrid_path, total_durati
         if not seg_tg.tierNames:
             continue
 
-        current_tier_name = seg_tg.tierNames[0]
-        tier_name = current_tier_name
-        tier = seg_tg.getTier(current_tier_name)
-        for entry in tier.entries:
-            start = float(entry.start) + seg_offset
-            end = float(entry.end) + seg_offset
-            label = "" if entry.label is None else str(entry.label)
-            shifted_intervals.append((start, end, label))
+        for tier_name in seg_tg.tierNames:
+            tier = seg_tg.getTier(tier_name)
+            bucket = tier_to_intervals.setdefault(tier_name, [])
+            for entry in tier.entries:
+                start = float(entry.start) + seg_offset
+                end = float(entry.end) + seg_offset
+                label = "" if entry.label is None else str(entry.label)
+                bucket.append((start, end, label))
 
-    shifted_intervals.sort(key=lambda x: (x[0], x[1]))
+    for intervals in tier_to_intervals.values():
+        intervals.sort(key=lambda x: (x[0], x[1]))
 
     merged_tg = textgrid.Textgrid()
-    merged_tier = _build_interval_tier(
-        tier_name=tier_name,
-        intervals=shifted_intervals,
-        max_t=float(total_duration_sec),
-    )
-    merged_tg.addTier(merged_tier)
+    if not tier_to_intervals:
+        for tier_name in ("Sentence", "Word", "Phoneme"):
+            merged_tg.addTier(
+                _build_interval_tier(
+                    tier_name=tier_name,
+                    intervals=_ensure_nonempty_intervals([], float(total_duration_sec)),
+                    max_t=float(total_duration_sec),
+                )
+            )
+    else:
+        preferred_order = ["Sentence", "Word", "Phoneme"]
+        ordered_tiers = [name for name in preferred_order if name in tier_to_intervals]
+        ordered_tiers.extend(
+            [name for name in tier_to_intervals.keys() if name not in preferred_order]
+        )
+
+        for tier_name in ordered_tiers:
+            merged_tg.addTier(
+                _build_interval_tier(
+                    tier_name=tier_name,
+                    intervals=_ensure_nonempty_intervals(
+                        tier_to_intervals[tier_name],
+                        float(total_duration_sec),
+                    ),
+                    max_t=float(total_duration_sec),
+                )
+            )
 
     output_path_obj = Path(merged_textgrid_path)
     output_path_obj.parent.mkdir(parents=True, exist_ok=True)
@@ -235,17 +384,40 @@ def _run_single_pipeline(config_path, checkpoint_path, output_path, audio_path, 
 
     asr_path = segment_dir / "asr.txt"
     pinyin_path = segment_dir / "pinyin.txt"
-    vocab_set = _load_vocab_set(_load_runtime_config(config_path))
+    runtime_config = _load_runtime_config(config_path)
+    g2p_cfg = runtime_config.get("g2p") or {}
+    custom_phrases = g2p_cfg.get("custom_phrases")
+    vocab_set = _load_vocab_set(runtime_config)
 
     acoustic_transcription = get_asr_transcriptions(audio_path, str(asr_path))
-    pinyin_transcription = hanzi2pinyin(acoustic_transcription)
-    normalized_tokens = _normalize_tokens_for_alignment(pinyin_transcription, vocab_set)
+    pinyin_tokens_tone = hanzi2pinyin_tokens(
+        acoustic_transcription,
+        custom_phrases=custom_phrases,
+    )
+    normalized_tokens, aligned_tone_tokens = _normalize_tokens_for_alignment(
+        pinyin_tokens_tone,
+        vocab_set,
+    )
+    ipa_tokens = pinyin_tokens_to_ipa_tokens(aligned_tone_tokens)
+
+    words = _segment_words(acoustic_transcription)
+    word_token_counts = []
+    for word in words:
+        _, word_kept_tones = _normalize_tokens_for_alignment(
+            hanzi2pinyin_tokens(word, custom_phrases=custom_phrases),
+            vocab_set,
+        )
+        word_token_counts.append(len(word_kept_tones))
+
     if not normalized_tokens:
         logger.warning("Skip segment %s: no valid vocab token for alignment", seg_index)
         return {
             "audio_path": audio_path,
             "asr_text": acoustic_transcription,
-            "pinyin_text": pinyin_transcription,
+            "pinyin_tokens_tone": pinyin_tokens_tone,
+            "align_tokens_no_tone": [],
+            "ipa_tokens": [],
+            "alignment_textgrid_path": None,
             "textgrid_path": None,
             "skipped": True,
         }
@@ -259,10 +431,22 @@ def _run_single_pipeline(config_path, checkpoint_path, output_path, audio_path, 
         audio_path=audio_path,
         transcript_path=str(pinyin_path),
     )
+
+    _rewrite_three_tier_textgrid(
+        alignment_textgrid_path=textgrid_path,
+        asr_text=acoustic_transcription,
+        ipa_tokens=ipa_tokens,
+        words=words,
+        word_token_counts=word_token_counts,
+    )
+
     return {
         "audio_path": audio_path,
         "asr_text": acoustic_transcription,
-        "pinyin_text": " ".join(normalized_tokens),
+        "pinyin_tokens_tone": pinyin_tokens_tone,
+        "align_tokens_no_tone": normalized_tokens,
+        "ipa_tokens": ipa_tokens,
+        "alignment_textgrid_path": textgrid_path,
         "textgrid_path": textgrid_path,
         "skipped": False,
     }

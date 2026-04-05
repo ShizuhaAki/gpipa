@@ -42,3 +42,20 @@ ASR 阶段处理后，我们通过 G2P 过程将汉字全部转为拼音格式�
 
 ## 参考
 我们使用了[华东师范大学的儿化词表](https://yywz.ecnu.edu.cn/1f/58/c30556a335704/page.htm)
+
+## Gradio GUI
+
+在 `gpipa.ui` 中，我们实现了一个 Gradio 界面，支持：
+
+- 上传音频文件
+- 在页面中编辑并保存 `config.yml`
+- 运行完整 pipeline，并查看每个分段的 ASR / G2P / 对齐结果
+- 下载生成的 TextGrid 文件
+
+启动方式：
+
+```bash
+python3 -m gpipa.ui
+```
+
+默认地址：`http://127.0.0.1:7860`
