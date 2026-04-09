@@ -1,5 +1,8 @@
 # GPIPA: 简单快速的汉语边界检测和IPA转写工具
-## 流程图
+
+请参考：[技术文档](docs/technical.md) | [安装文档](docs/instllation.md)
+
+## 原理图
 ```mermaid
 flowchart LR
     语音 --BiLSTM--> 逐帧音素预测

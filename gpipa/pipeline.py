@@ -136,11 +136,14 @@ def _load_runtime_config(config_path):
 
 
 def _get_audio_duration_sec(audio_path):
-    info = torchaudio.info(audio_path)
-    if info.sample_rate <= 0:
-        waveform, sr = torchaudio.load(audio_path)
-        return float(waveform.shape[-1]) / float(sr)
-    return float(info.num_frames) / float(info.sample_rate)
+    audio_info = getattr(torchaudio, "info", None)
+    if callable(audio_info):
+        info = audio_info(audio_path)
+        if info.sample_rate > 0:
+            return float(info.num_frames) / float(info.sample_rate)
+
+    waveform, sr = torchaudio.load(audio_path)
+    return float(waveform.shape[-1]) / float(sr)
 
 
 def _load_vocab_set(config):
@@ -170,10 +173,7 @@ def _normalize_tokens_for_alignment(pinyin_tokens: str | Iterable[str], vocab_se
 
 
 def _build_interval_tier(tier_name, intervals, max_t):
-    try:
-        return textgrid.IntervalTier(name=tier_name, entries=intervals, minT=0.0, maxT=max_t)
-    except TypeError:
-        return textgrid.IntervalTier(name=tier_name, intervalList=intervals, minT=0.0, maxT=max_t)
+    return textgrid.IntervalTier(name=tier_name, entries=intervals, minT=0.0, maxT=max_t)
 
 
 def _save_textgrid(tg, output_path):

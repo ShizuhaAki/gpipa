@@ -40,3 +40,5 @@ tf_model.h5
 config.json
 merges.txt
 vocab.json
+
+vendor/ffmpeg/bin/**

@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpipa"
+version = "0.1.0"
+description = "Chinese boundary detection and IPA transcription tools."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "GPL-3.0-or-later" }
+authors = [
+  { name = "GPIPA contributors" },
+]
+dependencies = [
+  "numpy>=1.26,<3",
+  "pinyin-to-ipa>=0.0.2",
+  "praatio>=6.2,<7",
+  "pypinyin>=0.54,<1",
+  "pyyaml>=6.0,<7",
+  "rich>=13.0,<15",
+  "soundfile>=0.12,<1",
+  "torchcodec>=0.11.0",
+]
+
+[project.optional-dependencies]
+ui = [
+  "gradio>=5,<6",
+  "socksio>=1.0.0,<2",
+]
+acoustic = [
+  "datasets>=2.20,<4",
+  "jieba>=0.42,<1",
+  "numba>=0.60,<1",
+  "torch>=2.4,<3",
+  "torchaudio>=2.4,<3",
+  "tqdm>=4.66,<5",
+]
+asr = [
+  "qwen-asr>=0.0.6",
+]
+full = [
+  "datasets>=2.20,<4",
+  "gradio>=5,<6",
+  "jieba>=0.42,<1",
+  "numba>=0.60,<1",
+  "qwen-asr>=0.0.6",
+  "socksio>=1.0.0,<2",
+  "torch>=2.4,<3",
+  "torchaudio>=2.4,<3",
+  "tqdm>=4.66,<5",
+]
+
+[project.scripts]
+gpipa = "gpipa.cli:main"
+gpipa-ui = "gpipa.ui:launch"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gpipa"]

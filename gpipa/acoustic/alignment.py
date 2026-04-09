@@ -592,14 +592,6 @@ def export_textgrids(
     model, label2id = _load_model(Path(checkpoint_path), device)
     id2label = {idx: label for label, idx in label2id.items()}
     blank_id = label2id.get("sil", 0)
-    ds = DataBakerDataset(config["root_path"])
-    rec_idx_by_utt = {rec["utt_id"]: idx for idx, rec in enumerate(ds.records)}
-    collator = FrameWiseDataCollator(
-        label2id=label2id,
-        sampling_rate=config["sampling_rate"],
-        hop_length_ms=config["hop_length_ms"],
-        cache_dir=config.get("feature_cache_dir"),
-    )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     hop_s = float(config["hop_length_ms"]) / 1000.0
@@ -677,6 +669,14 @@ def export_textgrids(
         return
     if not uttids:
         raise ValueError("Test mode requires uttids. Use --uttids or --uttids-file.")
+    ds = DataBakerDataset(config["root_path"])
+    rec_idx_by_utt = {rec["utt_id"]: idx for idx, rec in enumerate(ds.records)}
+    collator = FrameWiseDataCollator(
+        label2id=label2id,
+        sampling_rate=config["sampling_rate"],
+        hop_length_ms=config["hop_length_ms"],
+        cache_dir=config.get("feature_cache_dir"),
+    )
     exported = 0
     boundary_mae_ms_sum = 0.0
     boundary_mae_ms_count = 0
